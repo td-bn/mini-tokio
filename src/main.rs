@@ -1,36 +1,75 @@
-use std::{collections::VecDeque, future::Future, pin::Pin, task::Context, time::{Instant, Duration}};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::Context,
+    time::{Duration, Instant},
+};
 
-use futures::task;
+use crossbeam::channel;
+use futures::task::{self, ArcWake};
 use mini_tokio::simple_future::Delay;
 
-type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
+struct Task {
+    // Mutex is a simple way to make tasks Sync
+    // Real tokio does not use Mutex
+    future: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    executor: channel::Sender<Arc<Task>>,
+}
+
+impl Task {
+    fn schedule(self: &Arc<Self>) {
+        let _ = self.executor.send(self.clone());
+    }
+
+    fn spawn<F>(future: F, sender: &channel::Sender<Arc<Task>>)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let task = Arc::new(Task {
+            future: Mutex::new(Box::pin(future)),
+            executor: sender.clone(),
+        });
+        let _ = sender.send(task);
+    }
+
+    fn poll(self: Arc<Self>) {
+        let waker = task::waker(self.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        let mut future = self.future.try_lock().unwrap();
+
+        let _ = future.as_mut().poll(&mut cx);
+    }
+}
+
+impl ArcWake for Task {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.schedule();
+    }
+}
 
 struct MiniTokio {
-    tasks: VecDeque<Task>
+    scheduled: channel::Receiver<Arc<Task>>,
+    sender: channel::Sender<Arc<Task>>,
 }
 
 impl MiniTokio {
     fn new() -> Self {
-        Self {
-            tasks: VecDeque::new()
-        }
+        let (sender, scheduled) = channel::unbounded();
+        Self { scheduled, sender }
     }
 
-    fn spawn<F>(&mut self, future: F) 
+    fn spawn<F>(&mut self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.tasks.push_back(Box::pin(future));
+        Task::spawn(future, &self.sender);
     }
 
     fn run(&mut self) {
-        let waker = task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        while let Some(mut task) = self.tasks.pop_front() {
-            if task.as_mut().poll(&mut cx).is_pending() {
-                self.tasks.push_back(task);
-            }
+        while let Ok(task) = self.scheduled.recv() {
+            task.poll();
         }
     }
 }
